@@ -1,0 +1,115 @@
+# BEFORE: original Azure DevOps pipeline, kept unchanged during the shadow period (see docs/MIGRATION.md).
+# Known defects are intentionally left in place (e.g. PlatformToolset=v1 in 'Publish artifacts').
+trigger:
+- none
+
+pr:
+  branches:
+    include:
+    - main
+  drafts: false
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  solution: '**/*.sln'
+  buildPlatform: 'x86'
+  buildConfiguration: 'Release'
+
+steps:
+- task: PowerShell@2
+  displayName: 'Install .NET 8.0 SDK x86 using dotnet-install script'
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Download dotnet-install.ps1 script
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      Invoke-WebRequest -Uri "https://dot.net/v1/dotnet-install.ps1" -OutFile "$env:TEMP\dotnet-install.ps1"
+
+      # Install .NET 8.0 SDK x86
+      Write-Host "Installing .NET 8.0 SDK x86..."
+      & "$env:TEMP\dotnet-install.ps1" -Channel 8.0 -Architecture x86 -InstallDir "${env:ProgramFiles(x86)}\dotnet" -Runtime dotnet -Verbose
+      & "$env:TEMP\dotnet-install.ps1" -Channel 8.0 -Architecture x86 -InstallDir "${env:ProgramFiles(x86)}\dotnet" -Verbose
+
+      Write-Host ".NET 8.0 SDK x86 installed successfully"
+
+      # Verify installation
+      $dotnetPath = "${env:ProgramFiles(x86)}\dotnet\dotnet.exe"
+      if (Test-Path $dotnetPath) {
+        Write-Host "Installed SDKs:"
+        & $dotnetPath --list-sdks
+        Write-Host "Installed Runtimes:"
+        & $dotnetPath --list-runtimes
+      } else {
+        Write-Error "dotnet.exe not found at $dotnetPath"
+        exit 1
+      }
+
+- task: PowerShell@2
+  displayName: 'Install Visual C++ Redistributables x86'
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Download and install VC++ Redistributables
+      $url = "https://aka.ms/vs/17/release/vc_redist.x86.exe"
+      $output = "$env:TEMP\vc_redist.x86.exe"
+      Write-Host "Downloading VC++ Redistributable x86..."
+      Invoke-WebRequest -Uri $url -OutFile $output
+      Write-Host "Installing VC++ Redistributable x86..."
+      Start-Process -FilePath $output -Args '/install /quiet /norestart' -Wait
+      Write-Host "VC++ Redistributable x86 installed successfully"
+
+- task: NuGetToolInstaller@1
+
+- task: NuGetCommand@2
+  displayName: 'Nuget restore'
+  inputs:
+    command: restore
+    restoreSolution: '$(solution)'
+    feedsToUse: 'config'
+    nugetConfigPath: nuget.config
+
+- task: VSBuild@1
+  displayName: 'Build solution'
+  inputs:
+    solution: '$(solution)'
+    msbuildArgs: '/p:PlatformToolset=v143'
+    platform: '$(buildPlatform)'
+    configuration: '$(buildConfiguration)'
+    msbuildArchitecture: '$(buildPlatform)'
+
+- task: VSBuild@1
+  displayName: 'Publish artifacts'
+  inputs:
+    solution: '$(solution)'
+    msbuildArgs: '/p:OutputPath=$(Build.ArtifactStagingDirectory) /p:PlatformToolset=v1'
+    platform: '$(buildPlatform)'
+    configuration: '$(buildConfiguration)'
+    msbuildArchitecture: '$(buildPlatform)'
+
+- task: PowerShell@2
+  displayName: 'Set DOTNET_ROOT for x86'
+  inputs:
+    targetType: 'inline'
+    script: |
+      Write-Host "##vso[task.setvariable variable=DOTNET_ROOT]C:\Program Files (x86)\dotnet"
+      Write-Host "##vso[task.setvariable variable=DOTNET_ROOT(x86)]C:\Program Files (x86)\dotnet"
+      Write-Host "DOTNET_ROOT set to C:\Program Files (x86)\dotnet"
+
+- task: VSTest@3
+  displayName: 'Run unit tests (x86)'
+  inputs:
+    testSelector: 'testAssemblies'
+    testAssemblyVer2: |
+      **\*Tests.dll
+      !**\*TestAdapter.dll
+      !**\obj\**
+    searchFolder: '$(Build.ArtifactStagingDirectory)'
+    codeCoverageEnabled: true
+    runSettingsFile: '$(System.DefaultWorkingDirectory)\coverlet.runsettings'
+    platform: 'x86'
+    runInParallel: false
+  env:
+    DOTNET_ROOT: C:\Program Files (x86)\dotnet
+    DOTNET_ROOT_X86: C:\Program Files (x86)\dotnet

@@ -1,0 +1,45 @@
+{
+  "pipeline": { "repo": "hello-ado-to-gha", "path": "azure-pipelines.yml", "ado_id": "sample" },
+  "status": "ready-with-flags",
+  "archetype": {
+    "id": "dotnet-windows-msbuild-x86",
+    "confidence": "high",
+    "reason": "vmImage windows-latest; VSBuild@1 + VSTest@3 + NuGetCommand@2; buildPlatform x86"
+  },
+  "platform": { "repo": "local", "workflow": "./.github/workflows/_dotnet-windows-ci.yml", "version": "0.1.0", "sha": "local" },
+  "files_changed": [".github/workflows/pr-validation.yml"],
+  "mapped": [
+    { "ado": "trigger: none", "gha": "no push trigger" },
+    { "ado": "pr.branches.include: main, drafts: false", "gha": "on.pull_request.branches [main] + ready_for_review + if !draft" },
+    { "ado": "pool.vmImage: windows-latest", "gha": "runs-on: windows-2022 (catalog label)" },
+    { "ado": "PowerShell dotnet-install.ps1 x86", "gha": "./.github/actions/setup-dotnet-x86" },
+    { "ado": "PowerShell vc_redist.x86.exe", "gha": "setup-dotnet-x86 install-vcredist (off: preinstalled on image)" },
+    { "ado": "NuGetToolInstaller@1 + NuGetCommand@2", "gha": "NuGet/setup-nuget + nuget restore -ConfigFile nuget.config" },
+    { "ado": "VSBuild@1 x2", "gha": "single msbuild with OutputPath=staging" },
+    { "ado": "PowerShell DOTNET_ROOT", "gha": "step-scoped env on the test step" },
+    { "ado": "VSTest@3", "gha": "vstest.console /Platform:x86 /Settings /Collect + TRX" }
+  ],
+  "unmapped": [],
+  "defects_fixed": [
+    { "what": "PlatformToolset=v1 (invalid toolset)", "where": "VSBuild@1 'Publish artifacts'" },
+    { "what": "Solution built twice to change OutputPath", "where": "VSBuild@1 steps" },
+    { "what": "Unverified downloads executed as admin", "where": "PowerShell@2 install steps" },
+    { "what": "Floating windows-latest image (now VS 2026)", "where": "pool.vmImage" },
+    { "what": "Zero test assemblies passed silently", "where": "VSTest@3" }
+  ],
+  "behaviour_changes": [
+    { "what": "Runner pinned to windows-2022", "why": "v143 toolset is VS 2022 native", "risk": "low" },
+    { "what": "Test results published as a check by a separate workflow_run workflow", "why": "keep PR job read-only", "risk": "low" },
+    { "what": "Build fails if no *Tests.dll found", "why": "prevent false green", "risk": "low" }
+  ],
+  "secrets_required": [],
+  "escalations": [],
+  "validation": { "actionlint": "pass", "zizmor": "pass", "script_parse": "pass" },
+  "required_check_name": "validate / build-test",
+  "parity_checks": [
+    "Same test count and outcomes as ADO (sample: 7 tests on x86 incl. X86_build_runs_in_a_32_bit_process)",
+    "Coverage within +/-0.5 pp",
+    "Duration p50 <= ADO",
+    "Failing test turns the check red"
+  ]
+}

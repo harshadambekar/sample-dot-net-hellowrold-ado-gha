@@ -1,0 +1,47 @@
+# Golden-path catalog read by the ado-to-gha-migration skill (.claude/skills/).
+# In production this file lives in the central platform repo (e.g. org/ci-platform) and
+# each archetype is consumed as  org/ci-platform/<workflow>@<sha> # v<version>.
+# In this sample the platform workflow lives in the same repo, so callers use './'.
+schema: 1
+platform_repo: local            # production: org/ci-platform
+catalog_version: 0.1.0
+
+archetypes:
+  - id: dotnet-windows-msbuild-x86
+    description: Windows, MSBuild solution built as x86, VSTest x86, coverage. .NET / native mix.
+    match_hints:                 # signals the skill uses to classify an ADO pipeline
+      pool_vmImage: [windows-latest, windows-2022, windows-2019]
+      tasks: [VSBuild@1, MSBuild@1, VSTest@2, VSTest@3, NuGetCommand@2]
+      variables: { buildPlatform: [x86] }
+    workflow: ./.github/workflows/_dotnet-windows-ci.yml
+    version: 0.1.0
+    sha: local                   # production: full commit SHA of the release tag
+    required_check: validate / build-test
+    inputs:                      # ADO source -> reusable-workflow input
+      solution:             { from: "variables.solution", default: "**/*.sln" }
+      build-platform:       { from: "variables.buildPlatform", default: x86 }
+      build-configuration:  { from: "variables.buildConfiguration", default: Release }
+      msbuild-architecture: { from: "VSBuild@1.inputs.msbuildArchitecture", default: x86 }
+      platform-toolset:     { from: "VSBuild@1.inputs.msbuildArgs /p:PlatformToolset", default: v143 }
+      dotnet-channel:       { from: "dotnet-install -Channel | UseDotNet@2.version", default: "8.0" }
+      nuget-config:         { from: "NuGetCommand@2.inputs.nugetConfigPath", default: nuget.config }
+      runsettings:          { from: "VSTest@3.inputs.runSettingsFile", default: coverlet.runsettings }
+      test-assembly-pattern: { from: "VSTest@3.inputs.testAssemblyVer2", default: "*Tests.dll" }
+    secrets:
+      nuget-feed-token: { when: "nuget.config contains a non-nuget.org source", prefer: oidc }
+    composite_actions:
+      - path: ./.github/actions/setup-dotnet-x86
+        replaces: ["PowerShell dotnet-install.ps1 -Architecture x86", "vc_redist.x86.exe download"]
+
+approved_actions:                # the only external actions generated code may reference
+  actions/checkout:                          { version: v7.0.1,  sha: 3d3c42e5aac5ba805825da76410c181273ba90b1 }
+  actions/cache:                             { version: v6.1.0,  sha: 55cc8345863c7cc4c66a329aec7e433d2d1c52a9 }
+  actions/upload-artifact:                   { version: v7.0.2,  sha: cf430e030ddbb5b0abf93d22962f4752f3646cd9 }
+  microsoft/setup-msbuild:                   { version: v3.0.0,  sha: 30375c66a4eea26614e0d39710365f22f8b0af57 }
+  NuGet/setup-nuget:                         { version: v3.1.0,  sha: b26b823c478ee115be5c9403e62c90b0bf943843 }
+  danielpalme/ReportGenerator-GitHub-Action: { version: v5.5.12, sha: 861674232075b2c6bd1405a04c4bb9b150653e81 }
+  dorny/test-reporter:                       { version: v3.2.0,  sha: d1b5dff021aa968b288b02285a8bf47471c5928a }
+
+runner_labels:                   # curated; never *-latest
+  windows: windows-2022
+  linux: ubuntu-24.04

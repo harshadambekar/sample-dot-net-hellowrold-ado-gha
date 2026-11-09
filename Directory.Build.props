@@ -1,0 +1,17 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- The pipeline builds the solution as Platform=x86; AnyCPU stays available for local work. -->
+    <Platforms>AnyCPU;x86</Platforms>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <!-- Lets tests assert they really run in a 32-bit process when built for x86. -->
+  <PropertyGroup Condition="'$(Platform)' == 'x86'">
+    <PlatformTarget>x86</PlatformTarget>
+    <DefineConstants>$(DefineConstants);X86_BUILD</DefineConstants>
+  </PropertyGroup>
+</Project>
