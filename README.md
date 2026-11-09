@@ -1,4 +1,4 @@
-# hello-ado-to-gha
+# Sample .NET Hello Work Application with claude skills and ADO to GitHub Action pipeline
 
 A sample repository that shows a complete Azure DevOps → GitHub Actions migration for PR validation, plus the Claude skill that repeats it across many pipelines.
 
