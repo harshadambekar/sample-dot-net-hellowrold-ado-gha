@@ -1,0 +1,40 @@
+# Publishes test results as a check run. Runs from the default branch in a separate,
+# privileged context so the PR workflow itself stays read-only — this is what lets fork
+# PRs get annotations without ever exposing a write token to PR code.
+# It never checks out or executes PR code; the artifact is treated as untrusted data.
+name: PR test report
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- no PR code is checked out or run; artifacts parsed as data only
+    workflows: [PR validation]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  report:
+    if: ${{ github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'skipped' && github.event.workflow_run.conclusion != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read   # download artifacts from the triggering run
+      checks: write   # create the check run
+      contents: read
+    steps:
+      # External action: dorny/test-reporter  (third party, allow-listed)
+      # Source : https://github.com/dorny/test-reporter   Type: JavaScript (node24)
+      # Does   : downloads the 'test-results' artifact from the triggering run, parses the
+      #          TRX files and creates a check run with per-test annotations on the PR commit.
+      # Access : the most privileged step in the setup - actions: read + checks: write. Safe
+      #          because it only parses artifact files as data and never runs PR code.
+      # Notes  : SHA is the peeled commit of tag v3.2.0 (annotated tag); see header rules in
+      #          _dotnet-windows-ci.yml for the pinning convention.
+      - name: Publish test results
+        uses: dorny/test-reporter@d1b5dff021aa968b288b02285a8bf47471c5928a # v3.2.0
+        with:
+          artifact: test-results
+          name: Unit tests (x86)
+          path: '**/*.trx'
+          reporter: dotnet-trx
+          fail-on-error: false   # gating is the PR workflow's job, not the reporter's
+          fail-on-empty: false

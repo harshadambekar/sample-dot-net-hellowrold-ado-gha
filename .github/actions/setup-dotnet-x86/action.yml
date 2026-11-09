@@ -1,0 +1,92 @@
+name: Setup .NET SDK (x86, side-by-side)
+description: >-
+  Installs a 32-bit .NET SDK into "Program Files (x86)\dotnet" without touching PATH or
+  DOTNET_ROOT, verifies the installer and the resulting binaries, and optionally installs
+  the VC++ x86 redistributable. Replaces the two inline PowerShell@2 install steps of the
+  original Azure Pipeline.
+
+inputs:
+  dotnet-channel:
+    description: SDK channel passed to dotnet-install (e.g. 8.0). Ignored if dotnet-version is set.
+    required: false
+    default: '8.0'
+  dotnet-version:
+    description: Exact SDK version (e.g. 8.0.415) for reproducible builds. Prefer global.json.
+    required: false
+    default: ''
+  extra-runtimes:
+    description: Space-separated extra shared runtimes to install (aspnetcore, windowsdesktop).
+    required: false
+    default: ''
+  install-vcredist:
+    description: Install the latest VC++ 2015-2022 x86 redistributable (already present on GitHub Windows images).
+    required: false
+    default: 'false'
+
+outputs:
+  dotnet-root:
+    description: Install directory of the x86 .NET SDK; feed it to DOTNET_ROOT_X86 / DOTNET_ROOT(x86).
+    value: ${{ steps.install.outputs.dotnet-root }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install .NET SDK x86 (pinned + hash-verified dotnet-install.ps1)
+      id: install
+      shell: pwsh
+      env:
+        # dotnet/install-scripts tag v2026.07.21. Bump both values together (Dependabot cannot);
+        # hash the bytes served by the raw URL (LF), not a git checkout (CRLF via .gitattributes).
+        INSTALL_SCRIPT_URL: https://raw.githubusercontent.com/dotnet/install-scripts/da3ce11ba63f3dbb0fb835d41bda2665d5c48e84/src/dotnet-install.ps1
+        INSTALL_SCRIPT_SHA256: 3bb07bc8025211836c1e4f9d3f6a044e55b1fb6eec518a6c78851d04e210442b
+        DOTNET_CHANNEL: ${{ inputs.dotnet-channel }}
+        DOTNET_VERSION: ${{ inputs.dotnet-version }}
+        EXTRA_RUNTIMES: ${{ inputs.extra-runtimes }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $script  = Join-Path $env:RUNNER_TEMP 'dotnet-install.ps1'
+        $root    = Join-Path ${env:ProgramFiles(x86)} 'dotnet'
+
+        Invoke-WebRequest -Uri $env:INSTALL_SCRIPT_URL -OutFile $script
+        $actual = (Get-FileHash -Algorithm SHA256 $script).Hash.ToLowerInvariant()
+        if ($actual -ne $env:INSTALL_SCRIPT_SHA256) {
+          throw "dotnet-install.ps1 hash mismatch. expected=$env:INSTALL_SCRIPT_SHA256 actual=$actual"
+        }
+
+        $common = @('-Architecture', 'x86', '-InstallDir', $root, '-NoPath')
+        $ver    = if ($env:DOTNET_VERSION) { @('-Version', $env:DOTNET_VERSION) } else { @('-Channel', $env:DOTNET_CHANNEL) }
+
+        # The SDK already contains the matching Microsoft.NETCore.App runtime, so the
+        # original separate "-Runtime dotnet" install is not repeated.
+        & $script @ver @common
+        foreach ($rt in ($env:EXTRA_RUNTIMES -split '\s+' | Where-Object { $_ })) {
+          & $script @ver @common -Runtime $rt
+        }
+
+        $exe = Join-Path $root 'dotnet.exe'
+        if (-not (Test-Path $exe)) { throw "dotnet.exe not found at $exe" }
+        $sig = Get-AuthenticodeSignature $exe
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+          throw "dotnet.exe signature check failed: $($sig.Status) $($sig.SignerCertificate.Subject)"
+        }
+
+        & $exe --list-sdks
+        & $exe --list-runtimes
+        "dotnet-root=$root" >> $env:GITHUB_OUTPUT
+
+    - name: Install VC++ Redistributable x86
+      if: inputs.install-vcredist == 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $exe = Join-Path $env:RUNNER_TEMP 'vc_redist.x86.exe'
+        # aka.ms always serves the latest build, so a fixed hash is impossible; verify the
+        # Authenticode signature instead.
+        Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x86.exe' -OutFile $exe
+        $sig = Get-AuthenticodeSignature $exe
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+          throw "vc_redist signature check failed: $($sig.Status)"
+        }
+        $p = Start-Process -FilePath $exe -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+        # 0 = installed, 1638 = newer version already present, 3010 = reboot required
+        if ($p.ExitCode -notin 0, 1638, 3010) { throw "vc_redist failed with exit code $($p.ExitCode)" }

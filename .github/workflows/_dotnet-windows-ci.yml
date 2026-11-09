@@ -1,0 +1,369 @@
+# Reusable workflow: build + test + coverage for x86 .NET / MSBuild solutions on Windows.
+# Callers pin it by ref (same repo) or by commit SHA (central platform repo).
+#
+# How external actions are referenced in this file
+# ------------------------------------------------
+# An action is a separate GitHub repo with an action.yml at its root. 'uses: owner/repo@ref'
+# downloads that repo at <ref> and runs it inside this job - it is a dependency, like a
+# NuGet package, and it can see whatever this job can see (checkout, runner files, env).
+#
+# Rules for every external 'uses:' line:
+#   1. Pin to a full 40-char commit SHA. Tags (@v7) can be moved; a SHA cannot.
+#   2. Keep the '# vX.Y.Z' comment - humans read it and Dependabot rewrites SHA + comment
+#      together (see .github/dependabot.yml, 7-day cooldown).
+#   3. Resolve SHAs from the action's own repo (git ls-remote), never from a blog/README.
+#   4. Only use publishers on the org allow-list (GitHub-owned or explicitly approved).
+#   5. Pass values via 'with:' / 'env:', never by interpolating ${{ }} into run: scripts.
+#
+# Each external step below carries a short card: Source / Type / Does / Access / Notes.
+name: dotnet-windows-ci (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label. Pinned image, not *-latest (windows-latest now ships VS 2026).
+        type: string
+        default: windows-2022
+      solution:
+        description: Solution glob, resolved relative to the repo root.
+        type: string
+        default: '**/*.sln'
+      build-platform:
+        type: string
+        default: x86
+      build-configuration:
+        type: string
+        default: Release
+      msbuild-architecture:
+        type: string
+        default: x86
+      platform-toolset:
+        type: string
+        default: v143
+      dotnet-channel:
+        type: string
+        default: '8.0'
+      nuget-version:
+        type: string
+        default: '6.x'
+      nuget-config:
+        type: string
+        default: nuget.config
+      nuget-auth-sources:
+        description: Space-separated nuget.config source names that need the nuget-feed-token secret.
+        type: string
+        default: ''
+      test-assembly-pattern:
+        type: string
+        default: '*Tests.dll'
+      runsettings:
+        description: Path to a .runsettings file (skipped with a warning if missing).
+        type: string
+        default: coverlet.runsettings
+      coverage-collector:
+        description: vstest /Collect value. Empty = rely on runsettings only.
+        type: string
+        default: 'Code Coverage;Format=Cobertura'
+      min-line-coverage:
+        description: Fail if merged line coverage (%) is below this. 0 disables the gate.
+        type: number
+        default: 0
+      fail-on-no-tests:
+        type: boolean
+        default: true
+      install-vcredist:
+        type: boolean
+        default: false
+      upload-binaries:
+        type: boolean
+        default: true
+      retention-days:
+        type: number
+        default: 7
+      timeout-minutes:
+        type: number
+        default: 45
+    secrets:
+      nuget-feed-token:
+        description: Read-only token for private feeds (Azure Artifacts PAT, GitHub Packages token, ...).
+        required: false
+    outputs:
+      line-coverage:
+        description: Merged line coverage percentage.
+        value: ${{ jobs.build-test.outputs.line-coverage }}
+
+permissions: {}
+
+jobs:
+  build-test:
+    name: build-test
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    outputs:
+      line-coverage: ${{ steps.coverage.outputs.line-coverage }}
+    env:
+      DOTNET_NOLOGO: 'true'
+      DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+      NUGET_XMLDOC_MODE: skip
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Init paths
+        run: |
+          # runner.temp is not available in job-level env, so derive the paths here.
+          "STAGING_DIR=$env:RUNNER_TEMP\staging"   >> $env:GITHUB_ENV
+          "RESULTS_DIR=$env:RUNNER_TEMP\TestResults" >> $env:GITHUB_ENV
+          "LOG_DIR=$env:RUNNER_TEMP\logs"          >> $env:GITHUB_ENV
+
+      # External action: actions/checkout  (GitHub-owned)
+      # Source : https://github.com/actions/checkout   Type: JavaScript (node24)
+      # Does   : clones this repo at the PR merge commit into the workspace.
+      # Access : uses GITHUB_TOKEN (contents: read) to fetch.
+      # Notes  : persist-credentials: false stops the token being written to .git/config,
+      #          so later steps running PR code cannot reuse it.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Local composite action (this repo): .github/actions/setup-dotnet-x86/action.yml
+      # Does   : installs the x86 .NET SDK side by side, hash-verifies the installer and
+      #          signature-checks dotnet.exe. Outputs dotnet-root for the test step.
+      # Notes  : not pinned by SHA because it is versioned with this repo's own commit.
+      - name: Setup .NET SDK x86
+        id: dotnet
+        # './' resolves against the caller's checkout. Once centralised, switch to
+        # '$/.github/actions/setup-dotnet-x86' (self-repository syntax, runner >= 2.336)
+        # when actionlint supports it - see docs/MIGRATION.md.
+        uses: ./.github/actions/setup-dotnet-x86
+        with:
+          dotnet-channel: ${{ inputs.dotnet-channel }}
+          install-vcredist: ${{ inputs.install-vcredist }}
+
+      # External action: microsoft/setup-msbuild  (Microsoft)
+      # Source : https://github.com/microsoft/setup-msbuild   Type: JavaScript (node24)
+      # Does   : finds MSBuild in the installed Visual Studio via vswhere and adds it to PATH.
+      #          msbuild-architecture: x86 selects 32-bit MSBuild (ADO: msbuildArchitecture).
+      # Access : no token, no network; reads the runner's VS install only.
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+        with:
+          msbuild-architecture: ${{ inputs.msbuild-architecture }}
+
+      # External action: NuGet/setup-nuget  (NuGet team, Microsoft)
+      # Source : https://github.com/NuGet/setup-nuget   Type: JavaScript (node24)
+      # Does   : downloads nuget.exe and puts it on PATH (ADO: NuGetToolInstaller@1).
+      #          '6.x' = latest 6.* release; use an exact X.Y.Z for full reproducibility.
+      # Access : downloads from dist.nuget.org; no repo token needed.
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@b26b823c478ee115be5c9403e62c90b0bf943843 # v3.1.0
+        with:
+          nuget-version: ${{ inputs.nuget-version }}
+
+      # External action: actions/cache  (GitHub-owned)
+      # Source : https://github.com/actions/cache   Type: JavaScript (node24)
+      # Does   : restores the NuGet package folders before restore and saves them after the
+      #          job. key = hash of package manifests; restore-keys gives a partial hit.
+      # Access : runner's internal cache token; no GITHUB_TOKEN scopes.
+      # Notes  : PR runs can read caches from main but only write to their own PR scope,
+      #          so a malicious PR cannot poison main's cache.
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.nuget/packages
+            packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/packages.lock.json', '**/*.csproj', '**/*.vcxproj', '**/packages.config', '**/Directory.Packages.props', '**/nuget.config') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Resolve solutions
+        env:
+          SOLUTION_GLOB: ${{ inputs.solution }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Translate the ADO-style '**/*.sln' glob into a recursive search.
+          $leaf = Split-Path $env:SOLUTION_GLOB -Leaf
+          $recurse = $env:SOLUTION_GLOB -like '**/*'
+          $base = if ($recurse) { '.' } else { Split-Path $env:SOLUTION_GLOB -Parent }
+          if (-not $base) { $base = '.' }
+          $slns = Get-ChildItem -Path $base -Filter $leaf -File -Recurse:$recurse |
+                  Where-Object { $_.FullName -notmatch '[\\/](node_modules|\.git)[\\/]' } |
+                  ForEach-Object FullName
+          if (-not $slns) { throw "No solution matched '$env:SOLUTION_GLOB'" }
+          $slns | Tee-Object -FilePath "$env:RUNNER_TEMP\solutions.txt"
+
+      - name: NuGet restore
+        env:
+          NUGET_CONFIG: ${{ inputs.nuget-config }}
+          NUGET_AUTH_SOURCES: ${{ inputs.nuget-auth-sources }}
+          FEED_TOKEN: ${{ secrets.nuget-feed-token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Credentials go in process-scoped env vars that NuGet reads natively, so nothing is
+          # written to nuget.config on disk and nothing leaks into later steps or binlogs.
+          if ($env:NUGET_AUTH_SOURCES) {
+            if (-not $env:FEED_TOKEN) {
+              throw 'nuget-auth-sources is set but nuget-feed-token is empty (fork PRs do not receive secrets).'
+            }
+            foreach ($src in ($env:NUGET_AUTH_SOURCES -split '\s+' | Where-Object { $_ })) {
+              [Environment]::SetEnvironmentVariable("NuGetPackageSourceCredentials_$src", "Username=ci;Password=$env:FEED_TOKEN", 'Process')
+            }
+          }
+          foreach ($sln in Get-Content "$env:RUNNER_TEMP\solutions.txt") {
+            nuget restore $sln -ConfigFile $env:NUGET_CONFIG -NonInteractive
+            if ($LASTEXITCODE) { throw "nuget restore failed for $sln" }
+          }
+
+      - name: Build
+        env:
+          CONFIGURATION: ${{ inputs.build-configuration }}
+          PLATFORM: ${{ inputs.build-platform }}
+          TOOLSET: ${{ inputs.platform-toolset }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force $env:STAGING_DIR, $env:LOG_DIR | Out-Null
+          $i = 0
+          foreach ($sln in Get-Content "$env:RUNNER_TEMP\solutions.txt") {
+            $i++
+            # One build replaces the original two VSBuild@1 steps. OutputPath keeps the
+            # original flattened layout the tests ran from; the second ADO step's
+            # PlatformToolset=v1 typo is not carried over.
+            msbuild $sln /m /nologo /v:minimal `
+              "/p:Configuration=$env:CONFIGURATION" `
+              "/p:Platform=$env:PLATFORM" `
+              "/p:PlatformToolset=$env:TOOLSET" `
+              "/p:OutputPath=$env:STAGING_DIR\" `
+              /p:ContinuousIntegrationBuild=true `
+              "/bl:$env:LOG_DIR\build-$i.binlog"
+            if ($LASTEXITCODE) { throw "msbuild failed for $sln" }
+          }
+
+      - name: Test (vstest.console, x86)
+        id: test
+        env:
+          TEST_PATTERN: ${{ inputs.test-assembly-pattern }}
+          RUNSETTINGS: ${{ inputs.runsettings }}
+          COLLECTOR: ${{ inputs.coverage-collector }}
+          FAIL_ON_NO_TESTS: ${{ inputs.fail-on-no-tests }}
+          # Scoped to this step only, mirroring the env block of the original VSTest@3 task.
+          DOTNET_ROOT: ${{ steps.dotnet.outputs.dotnet-root }}
+          DOTNET_ROOT_X86: ${{ steps.dotnet.outputs.dotnet-root }}
+          DOTNET_ROOT(x86): ${{ steps.dotnet.outputs.dotnet-root }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vstest  = & $vswhere -latest -products * -find '**\TestPlatform\vstest.console.exe' | Select-Object -First 1
+          if (-not $vstest) { throw 'vstest.console.exe not found' }
+
+          # Same selection as the ADO testAssemblyVer2 block.
+          $dlls = Get-ChildItem $env:STAGING_DIR -Recurse -File -Filter $env:TEST_PATTERN |
+                  Where-Object { $_.Name -notlike '*TestAdapter.dll' -and $_.FullName -notmatch '\\obj\\' } |
+                  ForEach-Object FullName
+          if (-not $dlls) {
+            if ($env:FAIL_ON_NO_TESTS -eq 'true') { throw "No test assemblies matching $env:TEST_PATTERN" }
+            Write-Warning 'No test assemblies found'; exit 0
+          }
+
+          $vsArgs = @($dlls) + @(
+            '/Platform:x86', '/InIsolation',
+            '/Logger:trx', "/ResultsDirectory:$env:RESULTS_DIR",
+            "/TestAdapterPath:$env:STAGING_DIR"
+          )
+          if ($env:COLLECTOR) { $vsArgs += "/Collect:$env:COLLECTOR" }
+          if (Test-Path $env:RUNSETTINGS) { $vsArgs += "/Settings:$((Resolve-Path $env:RUNSETTINGS).Path)" }
+          else { Write-Warning "runsettings '$env:RUNSETTINGS' not found; running without it" }
+
+          & $vstest @vsArgs
+          if ($LASTEXITCODE) { throw "vstest.console exited with $LASTEXITCODE" }
+
+      # External action: danielpalme/ReportGenerator-GitHub-Action  (third party, allow-listed)
+      # Source : https://github.com/danielpalme/ReportGenerator-GitHub-Action   Type: JavaScript
+      # Does   : merges every *.cobertura.xml (MS Code Coverage and/or coverlet) into HTML,
+      #          a merged Cobertura file, a Markdown summary and Summary.json for the gate.
+      # Access : reads local files only; no token. Third-party publisher, hence SHA pin +
+      #          allow-list review before upgrades.
+      - name: Merge coverage report
+        if: ${{ !cancelled() && steps.test.conclusion != 'skipped' }}
+        uses: danielpalme/ReportGenerator-GitHub-Action@861674232075b2c6bd1405a04c4bb9b150653e81 # v5.5.12
+        with:
+          reports: ${{ runner.temp }}/TestResults/**/*.cobertura.xml
+          targetdir: ${{ runner.temp }}/coverage-report
+          reporttypes: HtmlInline;Cobertura;MarkdownSummaryGithub;JsonSummary
+          # Coverage of test assemblies themselves is noise.
+          assemblyfilters: -*Tests
+          verbosity: Warning
+
+      - name: Coverage summary and gate
+        id: coverage
+        if: ${{ !cancelled() && steps.test.conclusion != 'skipped' }}
+        env:
+          MIN_COVERAGE: ${{ inputs.min-line-coverage }}
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'coverage-report'
+          $md  = Join-Path $dir 'SummaryGithub.md'
+          $js  = Join-Path $dir 'Summary.json'
+          if (-not (Test-Path $js)) { Write-Warning 'No coverage produced'; exit 0 }
+          if (Test-Path $md) { Get-Content $md >> $env:GITHUB_STEP_SUMMARY }
+          $line = [double]((Get-Content $js -Raw | ConvertFrom-Json).summary.linecoverage)
+          "line-coverage=$line" >> $env:GITHUB_OUTPUT
+          if ([double]$env:MIN_COVERAGE -gt 0 -and $line -lt [double]$env:MIN_COVERAGE) {
+            throw "Line coverage $line% is below the $env:MIN_COVERAGE% gate"
+          }
+
+      # External action: actions/upload-artifact  (GitHub-owned) - used by all 4 upload steps
+      # Source : https://github.com/actions/upload-artifact   Type: JavaScript (node24)
+      # Does   : zips files from the runner and stores them on this workflow run, so they
+      #          survive the runner being discarded and can be downloaded or fetched later.
+      # Access : runner's internal runtime token; no GITHUB_TOKEN scopes. Anyone with read
+      #          access to the repo can download artifacts - never upload secrets.
+      # Notes  : artifacts are immutable and names must be unique per run.
+      # This upload: TRX files, even when tests fail (!cancelled()). The name 'test-results'
+      # is the contract with pr-test-report.yml - rename both together.
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results
+          path: ${{ runner.temp }}/TestResults/**/*.trx
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: warn
+
+      # actions/upload-artifact (see card above). HTML report + raw Cobertura for review.
+      # if-no-files-found: ignore - coverage is optional when no collector produced output.
+      - name: Upload coverage
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: |
+            ${{ runner.temp }}/coverage-report
+            ${{ runner.temp }}/TestResults/**/*.cobertura.xml
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: ignore
+
+      # actions/upload-artifact (see card above). MSBuild binlogs, only on failure, 3-day
+      # retention: binlogs can contain environment/property values, so keep them rare and
+      # short-lived.
+      - name: Upload build logs (on failure)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/logs
+          retention-days: 3
+          if-no-files-found: ignore
+
+      # actions/upload-artifact (see card above). Built binaries from the staging folder,
+      # only on success. if-no-files-found: error - a green build with no output is a bug.
+      - name: Upload build output
+        if: ${{ success() && inputs.upload-binaries }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-output-${{ inputs.build-platform }}-${{ inputs.build-configuration }}
+          path: ${{ runner.temp }}/staging
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error

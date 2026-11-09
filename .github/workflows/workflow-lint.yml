@@ -1,0 +1,27 @@
+# Guards the pipeline itself: lints workflow syntax and scans for Actions security issues.
+name: Workflow lint
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/**']
+
+permissions: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout (GitHub-owned), SHA-pinned; same card as in _dotnet-windows-ci.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: |
+          pipx run actionlint-py==1.7.12 -color
+      - name: zizmor
+        run: |
+          pipx run zizmor==1.32.0 --offline --min-severity medium .github/

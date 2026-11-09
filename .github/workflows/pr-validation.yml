@@ -1,0 +1,42 @@
+# Replaces the Azure Pipeline: PR validation for main, drafts excluded, no CI trigger.
+name: PR validation
+
+on:
+  pull_request:
+    branches: [main]
+    # ready_for_review re-runs validation when a draft is promoted (ADO: drafts: false).
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Deny-all default; each job asks only for what it needs.
+permissions: {}
+
+concurrency:
+  group: pr-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate
+    if: ${{ !github.event.pull_request.draft }}
+    permissions:
+      contents: read
+    # Reusable workflow in this repo, called like a function: 'with:' = arguments,
+    # 'secrets:' = explicitly passed secrets (nothing is inherited implicitly).
+    # Same repo, same commit, so no SHA pin is needed. Once moved to a central platform
+    # repo it becomes: org/ci-platform/.github/workflows/dotnet-windows.yml@<sha> # vX.Y.Z
+    uses: ./.github/workflows/_dotnet-windows-ci.yml
+    with:
+      runs-on: windows-2022
+      solution: '**/*.sln'
+      build-platform: x86
+      build-configuration: Release
+      msbuild-architecture: x86
+      platform-toolset: v143
+      dotnet-channel: '8.0'
+      nuget-config: nuget.config
+      runsettings: coverlet.runsettings
+      # Set when nuget.config points at private feeds, e.g. 'internal-feed'.
+      nuget-auth-sources: ''
+      min-line-coverage: 0
+    secrets:
+      nuget-feed-token: ${{ secrets.NUGET_FEED_TOKEN }}
